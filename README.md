@@ -1,6 +1,6 @@
 # ProofState Python SDK
 
-Python client for [ProofState](https://proofstate.ai): OpenTelemetry tracing, prompts, datasets, evaluations, scores, and the public REST API. This fork preserves the original MIT license and Git history.
+Python client for [ProofState](https://proofstate.ai): OpenTelemetry tracing, prompts, datasets, evaluations, scores, and the public REST API. The required MIT license notice is in [LICENSE](LICENSE).
 
 This repository contains a source prerelease. No package has been published to PyPI or verified against the live ProofState deployment. Use it with a matching server revision after authenticated end-to-end checks.
 
@@ -53,7 +53,7 @@ The SDK sends `x-proofstate-*` headers, `proofstate.*` OpenTelemetry attributes,
 
 Deploy the matching ProofState server protocol before using this version. The currently deployed server may require the prior protocol, so ingestion and generated REST responses must be checked together in a test deployment. No legacy-named fallback is emitted by this SDK.
 
-The generated `proofstate/api/` client mirrors the upstream API schema. When ProofState's API diverges, regenerate it from ProofState's OpenAPI/Fern source before publishing a new SDK release.
+The generated `proofstate/api/` client mirrors an API schema snapshot. When ProofState's API diverges, regenerate it from ProofState's OpenAPI/Fern source before publishing a new SDK release.
 
 The GitHub E2E job tests a local ProofState server checkout. It is skipped unless the repository variable `PROOFSTATE_E2E_ENABLED` is `true` and the `PROOFSTATE_SERVER_REPO_TOKEN` secret can read `JSOCIT-Inc/proofstate`. Live provider tests additionally need the provider API secrets. Unit, lint, type, and build checks run without those credentials.
 
@@ -68,4 +68,4 @@ python scripts/sanitize_generated_api_docs.py --check
 uv build --no-sources
 ```
 
-Before publishing, create a ProofState-owned source repository and PyPI project, configure a ProofState-owned trusted publisher, review the generated API against the deployed server, run unit and server-backed tests, and verify the wheel and source archive install in clean environments. The upstream automated publishing workflow has been removed from this fork; no package is published by cloning or building this repository.
+Before publishing, create a ProofState-owned PyPI project, configure a ProofState-owned trusted publisher, review the generated API against the deployed server, run unit and server-backed tests, and verify the wheel and source archive install in clean environments. No release workflow is configured yet; cloning or building this repository does not publish a package.
