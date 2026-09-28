@@ -202,10 +202,14 @@ def test_create_numeric_score():
 
     # Ensure data is sent
     proofstate.flush()
-    sleep(2)
 
     # Retrieve and verify
-    trace = api_wrapper.get_trace(trace_id)
+    trace = api_wrapper.get_trace(
+        trace_id,
+        is_result_ready=lambda trace: any(
+            score["name"] == "this-is-a-score" for score in trace.get("scores", [])
+        ),
+    )
 
     # Find the score by name (server may transform the ID format)
     score = next((s for s in trace["scores"] if s["name"] == "this-is-a-score"), None)
@@ -803,10 +807,14 @@ def test_score_trace():
 
     # Ensure data is sent
     proofstate.flush()
-    sleep(2)
 
     # Retrieve and verify
-    trace = api_wrapper.get_trace(trace_id)
+    trace = api_wrapper.get_trace(
+        trace_id,
+        is_result_ready=lambda trace: any(
+            score["name"] == "valuation" for score in trace.get("scores", [])
+        ),
+    )
 
     assert trace["name"] == trace_name
 
@@ -839,10 +847,14 @@ def test_score_trace_nested_trace():
 
     # Ensure data is sent
     proofstate.flush()
-    sleep(2)
 
     # Retrieve and verify
-    trace = get_api().trace.get(trace_id)
+    trace = wait_for_trace(
+        trace_id,
+        is_result_ready=lambda trace: any(
+            score.name == "valuation" for score in trace.scores
+        ),
+    )
 
     assert trace.name == trace_name
 
@@ -882,10 +894,14 @@ def test_score_trace_nested_observation():
 
     # Ensure data is sent
     proofstate.flush()
-    sleep(2)
 
     # Retrieve and verify
-    trace = get_api().trace.get(trace_id)
+    trace = wait_for_trace(
+        trace_id,
+        is_result_ready=lambda trace: any(
+            score.name == "valuation" for score in trace.scores
+        ),
+    )
 
     assert trace.name == trace_name
 
@@ -928,10 +944,15 @@ def test_score_span():
 
     # Ensure data is sent
     proofstate.flush()
-    sleep(3)
 
     # Retrieve and verify
-    trace = api_wrapper.get_trace(trace_id)
+    trace = api_wrapper.get_trace(
+        trace_id,
+        is_result_ready=lambda trace: (
+            len(trace.get("observations", [])) == 1
+            and any(score["name"] == "valuation" for score in trace.get("scores", []))
+        ),
+    )
 
     assert len(trace["observations"]) == 1
 
