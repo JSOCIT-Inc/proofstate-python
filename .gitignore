@@ -1,0 +1,41 @@
+__pycache__/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+
+playground
+
+# pyenv
+.python-version
+
+# Environments
+.env
+.venv
+.uv-tool/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# JetBrains
+.idea/
+
+/coverage.xml
+/.coverage
+
+.DS_Store
+
+# Docs
+docs
+
+# Llamaindex
+tests/mocks/llama-index-storage
+
+*.local.*
+
+# Codex local runtime state
+.codex/log/
+.codex/sessions/
+.codex/tmp/

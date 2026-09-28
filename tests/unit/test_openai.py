@@ -1,0 +1,1485 @@
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+from openai.types.responses import ParsedResponseOutputMessage, ParsedResponseOutputText
+from pydantic import BaseModel
+
+import proofstate.openai as proofstate_openai_module
+from proofstate._client.attributes import ProofStateOtelSpanAttributes
+from proofstate.openai import openai as proofstate_openai
+
+
+class DummySyncResponse:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class DummyAsyncResponse:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class DummyOpenAIStream(proofstate_openai.Stream):
+    def __init__(self, items, response) -> None:
+        self.response = response
+        self._iterator = iter(items)
+
+
+class DummyOpenAIAsyncStream(proofstate_openai.AsyncStream):
+    def __init__(self, items, response) -> None:
+        self.response = response
+        self._iterator = self._stream(items)
+
+    async def _stream(self, items):
+        for item in items:
+            yield item
+
+
+class DummyGeneration:
+    def __init__(self) -> None:
+        self.end_calls = 0
+
+    def update(self, **kwargs):
+        return self
+
+    def end(self) -> None:
+        self.end_calls += 1
+
+
+class DummyFallbackAsyncResponse:
+    def __init__(self) -> None:
+        self.close_calls = 0
+        self.aclose_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+
+
+def _make_chat_stream_chunks():
+    usage = SimpleNamespace(prompt_tokens=3, completion_tokens=1, total_tokens=4)
+
+    return [
+        SimpleNamespace(
+            model="gpt-4o-mini",
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        role="assistant",
+                        content="2",
+                        function_call=None,
+                        tool_calls=None,
+                    ),
+                    finish_reason=None,
+                )
+            ],
+            usage=None,
+        ),
+        SimpleNamespace(
+            model="gpt-4o-mini",
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        role=None,
+                        content=None,
+                        function_call=None,
+                        tool_calls=None,
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+            usage=usage,
+        ),
+    ]
+
+
+def _make_chat_stream_chunks_with_trailing_content_filter_chunk():
+    usage = SimpleNamespace(prompt_tokens=3, completion_tokens=1, total_tokens=4)
+
+    return [
+        SimpleNamespace(
+            model="gpt-4o-mini",
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        role="assistant",
+                        content="2",
+                        function_call=None,
+                        tool_calls=None,
+                    ),
+                    finish_reason=None,
+                )
+            ],
+            usage=None,
+        ),
+        SimpleNamespace(
+            model="gpt-4o-mini",
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        role=None,
+                        content=None,
+                        function_call=None,
+                        tool_calls=None,
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+            usage=usage,
+        ),
+        SimpleNamespace(
+            model="",
+            choices=[
+                SimpleNamespace(
+                    delta=None,
+                    finish_reason=None,
+                    content_filter_offsets={
+                        "check_offset": 44,
+                        "start_offset": 44,
+                        "end_offset": 121,
+                    },
+                    content_filter_results={
+                        "hate": {"filtered": False, "severity": "safe"},
+                        "self_harm": {"filtered": False, "severity": "safe"},
+                        "sexual": {"filtered": False, "severity": "safe"},
+                        "violence": {"filtered": False, "severity": "safe"},
+                    },
+                )
+            ],
+            usage=None,
+        ),
+    ]
+
+
+def _make_chat_stream_chunks_with_content_before_tool_call():
+    usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+
+    return [
+        SimpleNamespace(
+            model="gpt-4o-mini",
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        role="assistant",
+                        content="\n\n",
+                        function_call=None,
+                        tool_calls=None,
+                    ),
+                    finish_reason=None,
+                )
+            ],
+            usage=None,
+        ),
+        SimpleNamespace(
+            model="gpt-4o-mini",
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        role=None,
+                        content=None,
+                        function_call=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id="call_weather",
+                                type="function",
+                                function=SimpleNamespace(
+                                    name="get_weather",
+                                    arguments='{"city"',
+                                ),
+                            )
+                        ],
+                    ),
+                    finish_reason=None,
+                )
+            ],
+            usage=None,
+        ),
+        SimpleNamespace(
+            model="gpt-4o-mini",
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        role=None,
+                        content=None,
+                        function_call=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id=None,
+                                type=None,
+                                function=SimpleNamespace(
+                                    name=None,
+                                    arguments=': "Berlin"}',
+                                ),
+                            )
+                        ],
+                    ),
+                    finish_reason="tool_calls",
+                )
+            ],
+            usage=usage,
+        ),
+    ]
+
+
+def _make_single_chunk_stream():
+    return SimpleNamespace(
+        model="gpt-4o-mini",
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(
+                    role="assistant",
+                    content="2",
+                    function_call=None,
+                    tool_calls=None,
+                ),
+                finish_reason="stop",
+            )
+        ],
+        usage=None,
+    )
+
+
+def test_chat_completion_exports_generation_span(
+    proofstate_memory_client, get_span, json_attr
+):
+    openai_client = proofstate_openai.OpenAI(api_key="test")
+    response = SimpleNamespace(
+        model="gpt-4o-mini",
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    role="assistant",
+                    content="2",
+                    function_call=None,
+                    tool_calls=None,
+                    audio=None,
+                )
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=3, completion_tokens=1, total_tokens=4),
+    )
+
+    with patch.object(openai_client.chat.completions, "_post", return_value=response):
+        result = openai_client.chat.completions.create(
+            name="unit-openai-chat",
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "1 + 1 = ?"}],
+            temperature=0,
+            metadata={"suite": "unit"},
+        )
+
+    assert result is response
+
+    proofstate_memory_client.flush()
+    span = get_span("unit-openai-chat")
+
+    assert (
+        span.attributes[ProofStateOtelSpanAttributes.OBSERVATION_TYPE] == "generation"
+    )
+    assert (
+        span.attributes[ProofStateOtelSpanAttributes.OBSERVATION_MODEL] == "gpt-4o-mini"
+    )
+    assert span.attributes["proofstate.observation.metadata.suite"] == "unit"
+    assert json_attr(span, ProofStateOtelSpanAttributes.OBSERVATION_INPUT) == [
+        {"role": "user", "content": "1 + 1 = ?"}
+    ]
+    assert json_attr(span, ProofStateOtelSpanAttributes.OBSERVATION_OUTPUT) == {
+        "role": "assistant",
+        "content": "2",
+    }
+    assert json_attr(
+        span, ProofStateOtelSpanAttributes.OBSERVATION_MODEL_PARAMETERS
+    ) == {
+        "temperature": 0,
+        "max_tokens": "Infinity",
+        "top_p": 1,
+        "frequency_penalty": 0,
+        "presence_penalty": 0,
+    }
+    assert json_attr(span, ProofStateOtelSpanAttributes.OBSERVATION_USAGE_DETAILS) == {
+        "prompt_tokens": 3,
+        "completion_tokens": 1,
+        "total_tokens": 4,
+    }
+
+
+def test_chat_completion_with_none_choices_does_not_crash(
+    proofstate_memory_client, get_span, json_attr
+):
+    openai_client = proofstate_openai.OpenAI(api_key="test")
+    response = SimpleNamespace(
+        model="gpt-4o-mini",
+        choices=None,
+        usage=SimpleNamespace(prompt_tokens=3, completion_tokens=1, total_tokens=4),
+    )
+
+    with patch.object(openai_client.chat.completions, "_post", return_value=response):
+        result = openai_client.chat.completions.create(
+            name="unit-openai-chat-none-choices",
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "1 + 1 = ?"}],
+        )
+
+    assert result is response
+
+    proofstate_memory_client.flush()
+    span = get_span("unit-openai-chat-none-choices")
+
+    assert ProofStateOtelSpanAttributes.OBSERVATION_LEVEL not in span.attributes
+    assert (
+        span.attributes[ProofStateOtelSpanAttributes.OBSERVATION_MODEL] == "gpt-4o-mini"
+    )
+    assert json_attr(span, ProofStateOtelSpanAttributes.OBSERVATION_USAGE_DETAILS) == {
+        "prompt_tokens": 3,
+        "completion_tokens": 1,
+        "total_tokens": 4,
+    }
+
+
+def test_openai_stream_with_none_choices_chunk_does_not_crash(
+    proofstate_memory_client, get_span
+):
+    openai_client = proofstate_openai.OpenAI(api_key="test")
+    chunks_with_none_choices = [
+        SimpleNamespace(model="gpt-4o-mini", choices=None, usage=None),
+        *_make_chat_stream_chunks(),
+    ]
+    raw_stream = DummyOpenAIStream(chunks_with_none_choices, DummySyncResponse())
+
+    with patch.object(openai_client.chat.completions, "_post", return_value=raw_stream):
+        stream = openai_client.chat.completions.create(
+            name="unit-openai-stream-none-choices",
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "1 + 1 = ?"}],
+            stream=True,
+        )
+
+    chunks = list(stream)
+    stream.close()
+
+    assert len(chunks) == 3
+
+    proofstate_memory_client.flush()
+    span = get_span("unit-openai-stream-none-choices")
+
+    assert span.attributes[ProofStateOtelSpanAttributes.OBSERVATION_OUTPUT] == "2"
+    assert span.attributes["proofstate.observation.metadata.finish_reason"] == "stop"
+
+
+def test_streaming_chat_completion_preserves_tool_calls_after_content():
+    model, completion, usage, metadata, _service_tier = (
+        proofstate_openai_module._extract_streamed_openai_response(
+            SimpleNamespace(type="chat"),
+            _make_chat_stream_chunks_with_content_before_tool_call(),
+        )
+    )
+
+    assert model == "gpt-4o-mini"
+    assert completion == {
+        "role": "assistant",
+        "content": "\n\n",
+        "tool_calls": [
+            {
+                "id": "call_weather",
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "arguments": '{"city": "Berlin"}',
+                },
+            }
+        ],
+    }
+    assert usage.prompt_tokens == 10
+    assert metadata == {"finish_reason": "tool_calls"}
+
+
+def test_response_api_output_serializes_openai_parsed_response_objects():
+    class ParsedOutput(BaseModel):
+        name: str
+
+    _, completion, _, _ = (
+        proofstate_openai_module._get_proofstate_data_from_default_response(
+            SimpleNamespace(type="chat", object="Responses"),
+            {
+                "model": "gpt-4.1-mini",
+                "output": [
+                    ParsedResponseOutputMessage(
+                        id="msg_1",
+                        type="message",
+                        role="assistant",
+                        status="completed",
+                        content=[
+                            ParsedResponseOutputText(
+                                annotations=[],
+                                text='{"name":"dave"}',
+                                type="output_text",
+                                parsed=ParsedOutput(name="dave"),
+                            )
+                        ],
+                    )
+                ],
+                "usage": None,
+            },
+        )
+    )
+
+    assert completion == {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [
+            {
+                "annotations": [],
+                "text": '{"name":"dave"}',
+                "type": "output_text",
+                "logprobs": None,
+                "parsed": {"name": "dave"},
+            }
+        ],
+        "phase": None,
+    }
+
+
+def test_streaming_chat_completion_exports_ttft(
+    proofstate_memory_client, get_span, json_attr
+):
+    openai_client = proofstate_openai.OpenAI(api_key="test")
+    usage = SimpleNamespace(prompt_tokens=3, completion_tokens=1, total_tokens=4)
+
+    def fake_stream():
+        yield SimpleNamespace(
+            model="gpt-4o-mini",
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        role="assistant",
+                        content="2",
+                        function_call=None,
+                        tool_calls=None,
+                    ),
+                    finish_reason=None,
+                )
+            ],
+            usage=None,
+        )
+        yield SimpleNamespace(
+            model="gpt-4o-mini",
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        role=None,
+                        content=None,
+                        function_call=None,
+                        tool_calls=None,
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+            usage=usage,
+        )
+
+    with patch.object(
+        openai_client.chat.completions, "_post", return_value=fake_stream()
+    ):
+        stream = openai_client.chat.completions.create(
+            name="unit-openai-stream",
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "1 + 1 = ?"}],
+            temperature=0,
+            stream=True,
+        )
+        chunks = list(stream)
+
+    assert len(chunks) == 2
+
+    proofstate_memory_client.flush()
+    span = get_span("unit-openai-stream")
+
+    assert span.attributes[ProofStateOtelSpanAttributes.OBSERVATION_OUTPUT] == "2"
+    assert (
+        span.attributes[ProofStateOtelSpanAttributes.OBSERVATION_COMPLETION_START_TIME]
+        is not None
+    )
+    assert span.attributes["proofstate.observation.metadata.finish_reason"] == "stop"
+    assert json_attr(span, ProofStateOtelSpanAttributes.OBSERVATION_USAGE_DETAILS) == {
+        "prompt_tokens": 3,
+        "completion_tokens": 1,
+        "total_tokens": 4,
+    }
+
+
+def test_chat_completion_error_marks_generation_error(
+    proofstate_memory_client, get_span
+):
+    openai_client = proofstate_openai.OpenAI(api_key="test")
+
+    with patch.object(
+        openai_client.chat.completions,
+        "_post",
+        side_effect=RuntimeError("boom"),
+    ):
+        with pytest.raises(RuntimeError, match="boom"):
+            openai_client.chat.completions.create(
+                name="unit-openai-error",
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "explode"}],
+                temperature=0,
+            )
+
+    proofstate_memory_client.flush()
+    span = get_span("unit-openai-error")
+
+    assert span.attributes[ProofStateOtelSpanAttributes.OBSERVATION_LEVEL] == "ERROR"
+    assert (
+        "boom"
+        in span.attributes[ProofStateOtelSpanAttributes.OBSERVATION_STATUS_MESSAGE]
+    )
+    assert ProofStateOtelSpanAttributes.OBSERVATION_OUTPUT not in span.attributes
+
+
+def test_openai_stream_preserves_original_stream_contract(
+    proofstate_memory_client, get_span, json_attr
+):
+    openai_client = proofstate_openai.OpenAI(api_key="test")
+    raw_response = DummySyncResponse()
+    raw_stream = DummyOpenAIStream(_make_chat_stream_chunks(), raw_response)
+
+    with patch.object(openai_client.chat.completions, "_post", return_value=raw_stream):
+        stream = openai_client.chat.completions.create(
+            name="unit-openai-native-stream",
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "1 + 1 = ?"}],
+            temperature=0,
+            stream=True,
+        )
+
+    assert stream is raw_stream
+    assert isinstance(stream, proofstate_openai.Stream)
+    assert stream.response is raw_response
+
+    chunks = list(stream)
+    stream.close()
+
+    assert len(chunks) == 2
+    assert raw_response.closed is True
+
+    proofstate_memory_client.flush()
+    span = get_span("unit-openai-native-stream")
+
+    assert span.attributes[ProofStateOtelSpanAttributes.OBSERVATION_OUTPUT] == "2"
+    assert (
+        span.attributes[ProofStateOtelSpanAttributes.OBSERVATION_COMPLETION_START_TIME]
+        is not None
+    )
+    assert span.attributes["proofstate.observation.metadata.finish_reason"] == "stop"
+    assert json_attr(span, ProofStateOtelSpanAttributes.OBSERVATION_USAGE_DETAILS) == {
+        "prompt_tokens": 3,
+        "completion_tokens": 1,
+        "total_tokens": 4,
+    }
+
+
+def test_openai_stream_handles_trailing_azure_content_filter_chunk(
+    proofstate_memory_client, get_span, json_attr
+):
+    openai_client = proofstate_openai.OpenAI(api_key="test")
+    raw_stream = DummyOpenAIStream(
+        _make_chat_stream_chunks_with_trailing_content_filter_chunk(),
+        DummySyncResponse(),
+    )
+
+    with patch.object(openai_client.chat.completions, "_post", return_value=raw_stream):
+        stream = openai_client.chat.completions.create(
+            name="unit-openai-native-stream-azure-filter",
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "1 + 1 = ?"}],
+            temperature=0,
+            stream=True,
+        )
+
+    chunks = list(stream)
+    stream.close()
+
+    assert len(chunks) == 3
+
+    proofstate_memory_client.flush()
+    span = get_span("unit-openai-native-stream-azure-filter")
+
+    assert span.attributes[ProofStateOtelSpanAttributes.OBSERVATION_OUTPUT] == "2"
+    assert span.attributes["proofstate.observation.metadata.finish_reason"] == "stop"
+    assert json_attr(span, ProofStateOtelSpanAttributes.OBSERVATION_USAGE_DETAILS) == {
+        "prompt_tokens": 3,
+        "completion_tokens": 1,
+        "total_tokens": 4,
+    }
+
+
+def test_openai_stream_break_still_finalizes_generation(
+    proofstate_memory_client, get_span
+):
+    openai_client = proofstate_openai.OpenAI(api_key="test")
+    raw_response = DummySyncResponse()
+    raw_stream = DummyOpenAIStream(_make_chat_stream_chunks(), raw_response)
+
+    with patch.object(openai_client.chat.completions, "_post", return_value=raw_stream):
+        stream = openai_client.chat.completions.create(
+            name="unit-openai-native-stream-break",
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "1 + 1 = ?"}],
+            temperature=0,
+            stream=True,
+        )
+
+    for chunk in stream:
+        assert chunk.choices[0].delta.content == "2"
+        break
+
+    assert raw_response.closed is False
+
+    proofstate_memory_client.flush()
+    span = get_span("unit-openai-native-stream-break")
+
+    assert span.attributes[ProofStateOtelSpanAttributes.OBSERVATION_OUTPUT] == "2"
+    assert (
+        span.attributes[ProofStateOtelSpanAttributes.OBSERVATION_COMPLETION_START_TIME]
+        is not None
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_chat_completion_exports_generation_span(
+    proofstate_memory_client, get_span, json_attr
+):
+    openai_client = proofstate_openai.AsyncOpenAI(api_key="test")
+    response = SimpleNamespace(
+        model="gpt-4o-mini",
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    role="assistant",
+                    content="async result",
+                    function_call=None,
+                    tool_calls=None,
+                    audio=None,
+                )
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=5, completion_tokens=2, total_tokens=7),
+    )
+
+    with patch.object(openai_client.chat.completions, "_post", return_value=response):
+        result = await openai_client.chat.completions.create(
+            name="unit-openai-async",
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "hello"}],
+            temperature=0,
+        )
+
+    assert result is response
+
+    proofstate_memory_client.flush()
+    span = get_span("unit-openai-async")
+
+    assert json_attr(span, ProofStateOtelSpanAttributes.OBSERVATION_OUTPUT) == {
+        "role": "assistant",
+        "content": "async result",
+    }
+    assert json_attr(span, ProofStateOtelSpanAttributes.OBSERVATION_USAGE_DETAILS) == {
+        "prompt_tokens": 5,
+        "completion_tokens": 2,
+        "total_tokens": 7,
+    }
+
+
+@pytest.mark.asyncio
+async def test_openai_async_stream_preserves_original_stream_contract(
+    proofstate_memory_client, get_span, json_attr
+):
+    openai_client = proofstate_openai.AsyncOpenAI(api_key="test")
+    raw_response = DummyAsyncResponse()
+    raw_stream = DummyOpenAIAsyncStream(_make_chat_stream_chunks(), raw_response)
+
+    with patch.object(openai_client.chat.completions, "_post", return_value=raw_stream):
+        stream = await openai_client.chat.completions.create(
+            name="unit-openai-native-async-stream",
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "1 + 1 = ?"}],
+            temperature=0,
+            stream=True,
+        )
+
+    assert stream is raw_stream
+    assert isinstance(stream, proofstate_openai.AsyncStream)
+    assert stream.response is raw_response
+    assert hasattr(stream, "aclose")
+
+    chunks = []
+    async for chunk in stream:
+        chunks.append(chunk)
+
+    await stream.aclose()
+
+    assert len(chunks) == 2
+    assert raw_response.closed is True
+
+    proofstate_memory_client.flush()
+    span = get_span("unit-openai-native-async-stream")
+
+    assert span.attributes[ProofStateOtelSpanAttributes.OBSERVATION_OUTPUT] == "2"
+    assert (
+        span.attributes[ProofStateOtelSpanAttributes.OBSERVATION_COMPLETION_START_TIME]
+        is not None
+    )
+    assert span.attributes["proofstate.observation.metadata.finish_reason"] == "stop"
+    assert json_attr(span, ProofStateOtelSpanAttributes.OBSERVATION_USAGE_DETAILS) == {
+        "prompt_tokens": 3,
+        "completion_tokens": 1,
+        "total_tokens": 4,
+    }
+
+
+@pytest.mark.asyncio
+async def test_openai_async_stream_supports_anext(
+    proofstate_memory_client, get_span, json_attr
+):
+    openai_client = proofstate_openai.AsyncOpenAI(api_key="test")
+    raw_stream = DummyOpenAIAsyncStream(
+        _make_chat_stream_chunks(), DummyAsyncResponse()
+    )
+
+    with patch.object(openai_client.chat.completions, "_post", return_value=raw_stream):
+        stream = await openai_client.chat.completions.create(
+            name="unit-openai-native-async-anext",
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "1 + 1 = ?"}],
+            temperature=0,
+            stream=True,
+        )
+
+    first = await stream.__anext__()
+    second = await stream.__anext__()
+
+    assert first.choices[0].delta.content == "2"
+    assert second.choices[0].finish_reason == "stop"
+
+    with pytest.raises(StopAsyncIteration):
+        await stream.__anext__()
+
+    proofstate_memory_client.flush()
+    span = get_span("unit-openai-native-async-anext")
+
+    assert span.attributes[ProofStateOtelSpanAttributes.OBSERVATION_OUTPUT] == "2"
+    assert (
+        span.attributes[ProofStateOtelSpanAttributes.OBSERVATION_COMPLETION_START_TIME]
+        is not None
+    )
+    assert span.attributes["proofstate.observation.metadata.finish_reason"] == "stop"
+    assert json_attr(span, ProofStateOtelSpanAttributes.OBSERVATION_USAGE_DETAILS) == {
+        "prompt_tokens": 3,
+        "completion_tokens": 1,
+        "total_tokens": 4,
+    }
+
+
+@pytest.mark.asyncio
+async def test_openai_async_stream_break_still_finalizes_generation(
+    proofstate_memory_client, get_span
+):
+    openai_client = proofstate_openai.AsyncOpenAI(api_key="test")
+    raw_stream = DummyOpenAIAsyncStream(
+        _make_chat_stream_chunks(), DummyAsyncResponse()
+    )
+
+    with patch.object(openai_client.chat.completions, "_post", return_value=raw_stream):
+        stream = await openai_client.chat.completions.create(
+            name="unit-openai-native-async-stream-break",
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "1 + 1 = ?"}],
+            temperature=0,
+            stream=True,
+        )
+
+    async for chunk in stream:
+        assert chunk.choices[0].delta.content == "2"
+        break
+
+    # Async generator finalizers are scheduled across event-loop turns.
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    proofstate_memory_client.flush()
+    span = get_span("unit-openai-native-async-stream-break")
+
+    assert span.attributes[ProofStateOtelSpanAttributes.OBSERVATION_OUTPUT] == "2"
+    assert (
+        span.attributes[ProofStateOtelSpanAttributes.OBSERVATION_COMPLETION_START_TIME]
+        is not None
+    )
+
+
+def test_fallback_sync_stream_finalizes_once():
+    resource = SimpleNamespace(object="Completions", type="chat")
+    generation = DummyGeneration()
+
+    def fallback_stream():
+        yield _make_single_chunk_stream()
+
+    wrapper = proofstate_openai_module.ProofStateResponseGeneratorSync(
+        resource=resource,
+        response=fallback_stream(),
+        generation=generation,
+    )
+
+    list(wrapper)
+
+    with pytest.raises(StopIteration):
+        next(wrapper)
+
+    assert generation.end_calls == 1
+
+
+def test_fallback_sync_stream_exit_finalizes_once():
+    resource = SimpleNamespace(object="Completions", type="chat")
+    generation = DummyGeneration()
+
+    def fallback_stream():
+        yield _make_single_chunk_stream()
+
+    wrapper = proofstate_openai_module.ProofStateResponseGeneratorSync(
+        resource=resource,
+        response=fallback_stream(),
+        generation=generation,
+    )
+
+    wrapper.__exit__(None, None, None)
+
+    assert generation.end_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_fallback_async_stream_finalizes_once():
+    resource = SimpleNamespace(object="Completions", type="chat")
+    generation = DummyGeneration()
+
+    async def fallback_stream():
+        yield _make_single_chunk_stream()
+
+    wrapper = proofstate_openai_module.ProofStateResponseGeneratorAsync(
+        resource=resource,
+        response=fallback_stream(),
+        generation=generation,
+    )
+
+    async for _ in wrapper:
+        pass
+
+    with pytest.raises(StopAsyncIteration):
+        await wrapper.__anext__()
+
+    assert generation.end_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_fallback_async_stream_close_and_exit_finalize_once():
+    resource = SimpleNamespace(object="Completions", type="chat")
+    generation = DummyGeneration()
+    response = DummyFallbackAsyncResponse()
+
+    wrapper = proofstate_openai_module.ProofStateResponseGeneratorAsync(
+        resource=resource,
+        response=response,
+        generation=generation,
+    )
+
+    await wrapper.close()
+    await wrapper.__aexit__(None, None, None)
+
+    assert generation.end_calls == 1
+    assert response.close_calls == 1
+    assert response.aclose_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_fallback_async_stream_aclose_finalizes_once():
+    resource = SimpleNamespace(object="Completions", type="chat")
+    generation = DummyGeneration()
+
+    async def fallback_stream():
+        yield _make_single_chunk_stream()
+
+    wrapper = proofstate_openai_module.ProofStateResponseGeneratorAsync(
+        resource=resource,
+        response=fallback_stream(),
+        generation=generation,
+    )
+
+    await wrapper.aclose()
+
+    assert generation.end_calls == 1
+
+
+def test_embedding_exports_dimensions_and_count(
+    proofstate_memory_client, get_span, json_attr
+):
+    openai_client = proofstate_openai.OpenAI(api_key="test")
+    response = SimpleNamespace(
+        model="text-embedding-3-small",
+        data=[SimpleNamespace(embedding=[0.1, 0.2, 0.3])],
+        usage=SimpleNamespace(prompt_tokens=2, total_tokens=2),
+    )
+
+    with patch.object(openai_client.embeddings, "_post", return_value=response):
+        result = openai_client.embeddings.create(
+            name="unit-openai-embedding",
+            model="text-embedding-3-small",
+            input="hello world",
+        )
+
+    assert result is response
+
+    proofstate_memory_client.flush()
+    span = get_span("unit-openai-embedding")
+
+    assert span.attributes[ProofStateOtelSpanAttributes.OBSERVATION_TYPE] == "embedding"
+    assert json_attr(span, ProofStateOtelSpanAttributes.OBSERVATION_OUTPUT) == {
+        "dimensions": 3,
+        "count": 1,
+    }
+    assert json_attr(span, ProofStateOtelSpanAttributes.OBSERVATION_USAGE_DETAILS) == {
+        "input": 2
+    }
+
+
+def _make_chat_response(**extra_response_fields):
+    return SimpleNamespace(
+        model="gpt-4o-mini",
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    role="assistant",
+                    content="2",
+                    function_call=None,
+                    tool_calls=None,
+                    audio=None,
+                )
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=3, completion_tokens=1, total_tokens=4),
+        **extra_response_fields,
+    )
+
+
+def test_chat_completion_captures_request_service_tier(
+    proofstate_memory_client, get_span, json_attr
+):
+    openai_client = proofstate_openai.OpenAI(api_key="test")
+    response = _make_chat_response()
+
+    with patch.object(openai_client.chat.completions, "_post", return_value=response):
+        openai_client.chat.completions.create(
+            name="unit-openai-service-tier-request",
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "1 + 1 = ?"}],
+            temperature=0,
+            service_tier="flex",
+        )
+
+    proofstate_memory_client.flush()
+    span = get_span("unit-openai-service-tier-request")
+
+    model_parameters = json_attr(
+        span, ProofStateOtelSpanAttributes.OBSERVATION_MODEL_PARAMETERS
+    )
+    assert model_parameters["service_tier"] == "flex"
+    assert model_parameters["temperature"] == 0
+
+
+def test_chat_completion_service_tier_not_given_is_absent(
+    proofstate_memory_client, get_span, json_attr
+):
+    from openai._types import NOT_GIVEN
+
+    openai_client = proofstate_openai.OpenAI(api_key="test")
+    response = _make_chat_response()
+
+    with patch.object(openai_client.chat.completions, "_post", return_value=response):
+        openai_client.chat.completions.create(
+            name="unit-openai-service-tier-not-given",
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "1 + 1 = ?"}],
+            temperature=0,
+            service_tier=NOT_GIVEN,
+        )
+
+    proofstate_memory_client.flush()
+    span = get_span("unit-openai-service-tier-not-given")
+
+    model_parameters = json_attr(
+        span, ProofStateOtelSpanAttributes.OBSERVATION_MODEL_PARAMETERS
+    )
+    assert "service_tier" not in model_parameters
+
+
+def test_chat_completion_service_tier_absent_by_default(
+    proofstate_memory_client, get_span, json_attr
+):
+    openai_client = proofstate_openai.OpenAI(api_key="test")
+    response = _make_chat_response()
+
+    with patch.object(openai_client.chat.completions, "_post", return_value=response):
+        openai_client.chat.completions.create(
+            name="unit-openai-service-tier-absent",
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "1 + 1 = ?"}],
+            temperature=0,
+        )
+
+    proofstate_memory_client.flush()
+    span = get_span("unit-openai-service-tier-absent")
+
+    model_parameters = json_attr(
+        span, ProofStateOtelSpanAttributes.OBSERVATION_MODEL_PARAMETERS
+    )
+    assert "service_tier" not in model_parameters
+
+
+def test_chat_completion_response_service_tier_overrides_request(
+    proofstate_memory_client, get_span, json_attr
+):
+    openai_client = proofstate_openai.OpenAI(api_key="test")
+    response = _make_chat_response(service_tier="default")
+
+    with patch.object(openai_client.chat.completions, "_post", return_value=response):
+        openai_client.chat.completions.create(
+            name="unit-openai-service-tier-override",
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "1 + 1 = ?"}],
+            temperature=0,
+            service_tier="auto",
+        )
+
+    proofstate_memory_client.flush()
+    span = get_span("unit-openai-service-tier-override")
+
+    model_parameters = json_attr(
+        span, ProofStateOtelSpanAttributes.OBSERVATION_MODEL_PARAMETERS
+    )
+    # Response value is authoritative: it reflects the tier actually used.
+    assert model_parameters["service_tier"] == "default"
+    # Request-side model parameters must be preserved (merge, not clobber).
+    assert model_parameters["temperature"] == 0
+    assert model_parameters["top_p"] == 1
+
+
+@pytest.mark.asyncio
+async def test_async_chat_completion_response_service_tier_overrides_request(
+    proofstate_memory_client, get_span, json_attr
+):
+    openai_client = proofstate_openai.AsyncOpenAI(api_key="test")
+    response = _make_chat_response(service_tier="priority")
+
+    with patch.object(openai_client.chat.completions, "_post", return_value=response):
+        await openai_client.chat.completions.create(
+            name="unit-openai-async-service-tier-override",
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "1 + 1 = ?"}],
+            temperature=0,
+            service_tier="auto",
+        )
+
+    proofstate_memory_client.flush()
+    span = get_span("unit-openai-async-service-tier-override")
+
+    model_parameters = json_attr(
+        span, ProofStateOtelSpanAttributes.OBSERVATION_MODEL_PARAMETERS
+    )
+    assert model_parameters["service_tier"] == "priority"
+    assert model_parameters["temperature"] == 0
+
+
+def test_openai_stream_captures_service_tier_from_chunks(
+    proofstate_memory_client, get_span, json_attr
+):
+    openai_client = proofstate_openai.OpenAI(api_key="test")
+    chunks = _make_chat_stream_chunks()
+    for chunk in chunks:
+        chunk.service_tier = "default"
+    raw_stream = DummyOpenAIStream(chunks, DummySyncResponse())
+
+    with patch.object(openai_client.chat.completions, "_post", return_value=raw_stream):
+        stream = openai_client.chat.completions.create(
+            name="unit-openai-stream-service-tier",
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "1 + 1 = ?"}],
+            temperature=0,
+            service_tier="auto",
+            stream=True,
+        )
+
+    list(stream)
+    stream.close()
+
+    proofstate_memory_client.flush()
+    span = get_span("unit-openai-stream-service-tier")
+
+    model_parameters = json_attr(
+        span, ProofStateOtelSpanAttributes.OBSERVATION_MODEL_PARAMETERS
+    )
+    assert model_parameters["service_tier"] == "default"
+    assert model_parameters["temperature"] == 0
+
+
+@pytest.mark.asyncio
+async def test_openai_async_stream_captures_service_tier_from_chunks(
+    proofstate_memory_client, get_span, json_attr
+):
+    openai_client = proofstate_openai.AsyncOpenAI(api_key="test")
+    chunks = _make_chat_stream_chunks()
+    for chunk in chunks:
+        chunk.service_tier = "flex"
+    raw_stream = DummyOpenAIAsyncStream(chunks, DummyAsyncResponse())
+
+    with patch.object(openai_client.chat.completions, "_post", return_value=raw_stream):
+        stream = await openai_client.chat.completions.create(
+            name="unit-openai-async-stream-service-tier",
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "1 + 1 = ?"}],
+            temperature=0,
+            stream=True,
+        )
+
+    async for _ in stream:
+        pass
+
+    await stream.aclose()
+
+    proofstate_memory_client.flush()
+    span = get_span("unit-openai-async-stream-service-tier")
+
+    model_parameters = json_attr(
+        span, ProofStateOtelSpanAttributes.OBSERVATION_MODEL_PARAMETERS
+    )
+    assert model_parameters["service_tier"] == "flex"
+    assert model_parameters["temperature"] == 0
+
+
+def test_chat_completion_captures_reasoning_parameters(
+    proofstate_memory_client, get_span, json_attr
+):
+    openai_client = proofstate_openai.OpenAI(api_key="test")
+    response = _make_chat_response()
+
+    with patch.object(openai_client.chat.completions, "_post", return_value=response):
+        openai_client.chat.completions.create(
+            name="unit-openai-reasoning-params",
+            model="gpt-5",
+            messages=[{"role": "user", "content": "1 + 1 = ?"}],
+            reasoning_effort="minimal",
+            verbosity="low",
+        )
+
+    proofstate_memory_client.flush()
+    span = get_span("unit-openai-reasoning-params")
+
+    model_parameters = json_attr(
+        span, ProofStateOtelSpanAttributes.OBSERVATION_MODEL_PARAMETERS
+    )
+    assert model_parameters["reasoning_effort"] == "minimal"
+    assert model_parameters["verbosity"] == "low"
+
+
+def test_chat_completion_reasoning_parameters_absent_by_default(
+    proofstate_memory_client, get_span, json_attr
+):
+    from openai._types import NOT_GIVEN
+
+    openai_client = proofstate_openai.OpenAI(api_key="test")
+    response = _make_chat_response()
+
+    with patch.object(openai_client.chat.completions, "_post", return_value=response):
+        openai_client.chat.completions.create(
+            name="unit-openai-reasoning-params-absent",
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "1 + 1 = ?"}],
+            reasoning_effort=NOT_GIVEN,
+        )
+
+    proofstate_memory_client.flush()
+    span = get_span("unit-openai-reasoning-params-absent")
+
+    model_parameters = json_attr(
+        span, ProofStateOtelSpanAttributes.OBSERVATION_MODEL_PARAMETERS
+    )
+    assert "reasoning_effort" not in model_parameters
+    assert "verbosity" not in model_parameters
+
+
+def test_responses_kwargs_capture_reasoning_parameters():
+    data = proofstate_openai_module._get_proofstate_data_from_kwargs(
+        SimpleNamespace(type="chat", object="Responses"),
+        {
+            "model": "gpt-5",
+            "input": "1 + 1 = ?",
+            "reasoning": {"effort": "high", "summary": "auto"},
+            "text": {"verbosity": "high", "format": {"type": "text"}},
+            "max_output_tokens": 256,
+        },
+    )
+
+    model_parameters = data["model_parameters"]
+    assert model_parameters["reasoning_effort"] == "high"
+    assert model_parameters["reasoning_summary"] == "auto"
+    assert model_parameters["verbosity"] == "high"
+    assert model_parameters["max_output_tokens"] == 256
+    assert "max_tokens" not in model_parameters
+
+
+def test_embedding_model_parameters_do_not_include_service_tier(
+    proofstate_memory_client, get_span, json_attr
+):
+    openai_client = proofstate_openai.OpenAI(api_key="test")
+    response = SimpleNamespace(
+        model="text-embedding-3-small",
+        data=[SimpleNamespace(embedding=[0.1, 0.2, 0.3])],
+        usage=SimpleNamespace(prompt_tokens=2, total_tokens=2),
+    )
+
+    with patch.object(openai_client.embeddings, "_post", return_value=response):
+        openai_client.embeddings.create(
+            name="unit-openai-embedding-no-service-tier",
+            model="text-embedding-3-small",
+            input="hello world",
+            dimensions=3,
+        )
+
+    proofstate_memory_client.flush()
+    span = get_span("unit-openai-embedding-no-service-tier")
+
+    model_parameters = json_attr(
+        span, ProofStateOtelSpanAttributes.OBSERVATION_MODEL_PARAMETERS
+    )
+    assert model_parameters == {"dimensions": 3}
+
+
+def test_default_response_extraction_returns_service_tier():
+    (
+        model,
+        _completion,
+        _usage,
+        service_tier,
+    ) = proofstate_openai_module._get_proofstate_data_from_default_response(
+        SimpleNamespace(type="chat", object="Responses"),
+        {
+            "model": "gpt-4.1-mini",
+            "output": [],
+            "usage": None,
+            "service_tier": "flex",
+        },
+    )
+
+    assert model == "gpt-4.1-mini"
+    assert service_tier == "flex"
+
+
+def test_streamed_response_api_extraction_returns_service_tier():
+    final_response = SimpleNamespace(
+        model="gpt-4.1-mini",
+        output=[],
+        usage=SimpleNamespace(input_tokens=1, output_tokens=1, total_tokens=2),
+        service_tier="priority",
+        created_at=1700000000,
+        text=None,
+    )
+    chunks = [
+        SimpleNamespace(type="response.completed", response=final_response),
+    ]
+
+    (
+        model,
+        _completion,
+        _usage,
+        _metadata,
+        service_tier,
+    ) = proofstate_openai_module._extract_streamed_response_api_response(chunks)
+
+    assert model == "gpt-4.1-mini"
+    assert service_tier == "priority"
+
+
+def _chat_completion_payload():
+    return {
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 1700000000,
+        "model": "gpt-4o-mini-2024-07-18",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "2"},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 1,
+            "total_tokens": 11,
+            "prompt_tokens_details": {"cached_tokens": 4, "audio_tokens": 0},
+        },
+    }
+
+
+def _chat_completion_chunk_sse_body():
+    return (
+        'data: {"id":"chatcmpl-test","object":"chat.completion.chunk",'
+        '"created":1700000000,"model":"gpt-4o-mini-2024-07-18",'
+        '"choices":[{"index":0,"delta":{"role":"assistant","content":"2"},'
+        '"finish_reason":null}]}\n\n'
+        "data: [DONE]\n\n"
+    )
+
+
+def _mock_transport_openai_client(async_client: bool = False):
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if b'"stream": true' in request.content or b'"stream":true' in request.content:
+            return httpx.Response(
+                200,
+                content=_chat_completion_chunk_sse_body().encode(),
+                headers={"content-type": "text/event-stream"},
+            )
+
+        return httpx.Response(200, json=_chat_completion_payload())
+
+    if async_client:
+        return proofstate_openai.AsyncOpenAI(
+            api_key="test",
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+
+    return proofstate_openai.OpenAI(
+        api_key="test",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+
+def test_with_raw_response_chat_completion_captures_output_and_usage(
+    proofstate_memory_client, get_span, json_attr
+):
+    openai_client = _mock_transport_openai_client()
+
+    raw_response = openai_client.chat.completions.with_raw_response.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": "1 + 1 = ?"}],
+    )
+
+    parsed = raw_response.parse()
+    assert parsed.choices[0].message.content == "2"
+
+    proofstate_memory_client.flush()
+    span = get_span("OpenAI-generation")
+
+    assert (
+        span.attributes[ProofStateOtelSpanAttributes.OBSERVATION_TYPE] == "generation"
+    )
+    assert json_attr(span, ProofStateOtelSpanAttributes.OBSERVATION_OUTPUT) == {
+        "role": "assistant",
+        "content": "2",
+    }
+
+    usage = json_attr(span, ProofStateOtelSpanAttributes.OBSERVATION_USAGE_DETAILS)
+    assert usage["prompt_tokens"] == 10
+    assert usage["completion_tokens"] == 1
+    assert usage["total_tokens"] == 11
+    assert usage["prompt_tokens_details"] == {"cached_tokens": 4, "audio_tokens": 0}
+
+
+@pytest.mark.asyncio
+async def test_async_with_raw_response_chat_completion_captures_output_and_usage(
+    proofstate_memory_client, get_span, json_attr
+):
+    openai_client = _mock_transport_openai_client(async_client=True)
+
+    raw_response = await openai_client.chat.completions.with_raw_response.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": "1 + 1 = ?"}],
+    )
+
+    parsed = raw_response.parse()
+    assert parsed.choices[0].message.content == "2"
+
+    proofstate_memory_client.flush()
+    span = get_span("OpenAI-generation")
+
+    assert json_attr(span, ProofStateOtelSpanAttributes.OBSERVATION_OUTPUT) == {
+        "role": "assistant",
+        "content": "2",
+    }
+
+    usage = json_attr(span, ProofStateOtelSpanAttributes.OBSERVATION_USAGE_DETAILS)
+    assert usage["prompt_tokens_details"] == {"cached_tokens": 4, "audio_tokens": 0}
+
+
+def test_with_raw_response_skip_flag_disables_instrumentation(
+    proofstate_memory_client, memory_exporter, get_span, monkeypatch
+):
+    monkeypatch.setenv("PROOFSTATE_OPENAI_SKIP_RAW_RESPONSES", "True")
+    openai_client = _mock_transport_openai_client()
+
+    raw_response = openai_client.chat.completions.with_raw_response.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": "1 + 1 = ?"}],
+    )
+    assert raw_response.parse().choices[0].message.content == "2"
+
+    proofstate_memory_client.flush()
+    assert all(
+        span.name != "OpenAI-generation"
+        for span in memory_exporter.get_finished_spans()
+    )
+
+    openai_client.chat.completions.create(
+        name="unit-openai-direct-with-skip-flag",
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": "1 + 1 = ?"}],
+    )
+
+    proofstate_memory_client.flush()
+    span = get_span("unit-openai-direct-with-skip-flag")
+    assert (
+        span.attributes[ProofStateOtelSpanAttributes.OBSERVATION_TYPE] == "generation"
+    )
+
+
+def test_with_raw_response_streaming_passes_through_untraced(
+    proofstate_memory_client, memory_exporter
+):
+    openai_client = _mock_transport_openai_client()
+
+    raw_response = openai_client.chat.completions.with_raw_response.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": "1 + 1 = ?"}],
+        stream=True,
+    )
+
+    chunks = list(raw_response.parse())
+    assert chunks[0].choices[0].delta.content == "2"
+
+    proofstate_memory_client.flush()
+    assert all(
+        span.name != "OpenAI-generation"
+        for span in memory_exporter.get_finished_spans()
+    )

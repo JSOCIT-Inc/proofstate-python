@@ -1,0 +1,296 @@
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "main"
+    tags:
+      - "v*"
+  merge_group:
+  pull_request:
+    branches:
+      - "*"
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linting:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv and set Python version
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.11.2"
+          python-version: "3.13"
+          enable-cache: true # zizmor: ignore[cache-poisoning] CI-only, no artifacts published
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: Run Ruff
+        run: uv run --frozen ruff check .
+      - name: Check generated API prose
+        run: uv run --frozen python scripts/sanitize_generated_api_docs.py --check
+
+  type-checking:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv and set Python version
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.11.2"
+          python-version: "3.13"
+          enable-cache: true # zizmor: ignore[cache-poisoning] CI-only, no artifacts published
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # zizmor: ignore[cache-poisoning]
+        name: Cache mypy cache
+        with:
+          path: ./.mypy_cache
+          key: mypy-${{ hashFiles('**/*.py', 'pyproject.toml') }}
+          restore-keys: |
+            mypy-
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: Run mypy type checking
+        run: uv run --frozen mypy proofstate --no-error-summary
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv and set Python version
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.11.2"
+          python-version: "3.13"
+          enable-cache: true # zizmor: ignore[cache-poisoning] CI-only, no artifacts published
+      - name: Build source archive and wheel
+        run: uv build --no-sources
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PROOFSTATE_BASE_URL: "http://localhost:3000"
+      PROOFSTATE_PUBLIC_KEY: "pk-ps-test"
+      PROOFSTATE_SECRET_KEY: "sk-ps-test"
+      OPENAI_API_KEY: "test-openai-key"
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.10"
+          - "3.11"
+          - "3.12"
+          - "3.13"
+          - "3.14"
+
+    name: Unit tests on Python ${{ matrix.python-version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv and set Python version
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.11.2"
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true # zizmor: ignore[cache-poisoning] CI-only, no artifacts published
+
+      - name: Check Python version
+        run: python --version
+
+      - name: Install the project dependencies
+        run: uv sync --locked
+
+      - name: Run the automated tests
+        run: |
+          python --version
+          uv run --frozen pytest -n auto --dist worksteal -s -v --log-cli-level=INFO tests/unit
+
+  e2e-tests:
+    # Requires read access to the ProofState server repository. Without it,
+    # unit/build checks still run and this job is explicitly skipped.
+    if: ${{ vars.PROOFSTATE_E2E_ENABLED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: e2e
+            job_name: E2E shard 1 tests on Python 3.13
+            shard_name: shard-1
+            shard_index: 0
+            shard_count: 2
+          - suite: e2e
+            job_name: E2E shard 2 tests on Python 3.13
+            shard_name: shard-2
+            shard_index: 1
+            shard_count: 2
+          - suite: live_provider
+            job_name: E2E live-provider tests on Python 3.13
+            shard_name: live-provider
+    env:
+      PROOFSTATE_BASE_URL: "http://localhost:3000"
+      PROOFSTATE_PUBLIC_KEY: "pk-ps-1234567890"
+      PROOFSTATE_SECRET_KEY: "sk-ps-1234567890"
+      PROOFSTATE_INIT_ORG_ID: "0c6c96f4-0ca0-4f16-92a8-6dd7d7c6a501"
+      PROOFSTATE_INIT_ORG_NAME: "SDK Test Org"
+      PROOFSTATE_INIT_PROJECT_ID: "7a88fb47-b4e2-43b8-a06c-a5ce950dc53a"
+      PROOFSTATE_INIT_PROJECT_NAME: "SDK Test Project"
+      PROOFSTATE_INIT_PROJECT_PUBLIC_KEY: "pk-ps-1234567890"
+      PROOFSTATE_INIT_PROJECT_SECRET_KEY: "sk-ps-1234567890"
+      PROOFSTATE_INIT_USER_EMAIL: "sdk-tests@proofstate.local"
+      PROOFSTATE_INIT_USER_NAME: "SDK Tests"
+      PROOFSTATE_INIT_USER_PASSWORD: "proofstate-ci-password"
+      PROOFSTATE_E2E_READ_TIMEOUT_SECONDS: "60"
+      PROOFSTATE_E2E_READ_INTERVAL_SECONDS: "0.5"
+
+    name: ${{ matrix.job_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv and set Python version
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.11.2"
+          python-version: "3.13"
+          enable-cache: true # zizmor: ignore[cache-poisoning] CI-only, no artifacts published
+      - name: Install the project dependencies
+        run: uv sync --locked
+      - name: Check uv Python version
+        run: uv run --frozen python --version
+      - name: Check out ProofState server
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: JSOCIT-Inc/proofstate
+          token: ${{ secrets.PROOFSTATE_SERVER_REPO_TOKEN }}
+          path: proofstate-server
+          persist-credentials: false
+
+      - name: Prepare ProofState server compose
+        run: |
+          cp ./.github/proofstate-v4-dual-write.override.yml \
+            ./proofstate-server/docker-compose.override.yml
+          git -C ./proofstate-server rev-parse HEAD
+
+      - name: Run ProofState server
+        run: |
+          cd ./proofstate-server
+
+          echo "::group::Start ProofState server"
+          TELEMETRY_ENABLED=false \
+          NEXT_PUBLIC_PROOFSTATE_RUN_NEXT_INIT=true \
+          PROOFSTATE_S3_MEDIA_UPLOAD_ENDPOINT=http://localhost:9090 \
+          PROOFSTATE_INGESTION_QUEUE_DELAY_MS=10 \
+          PROOFSTATE_INGESTION_CLICKHOUSE_WRITE_INTERVAL_MS=10 \
+          QUEUE_CONSUMER_EVENT_PROPAGATION_QUEUE_IS_ENABLED=true \
+          docker compose up -d
+          echo "::endgroup::"
+
+      - name: Health check for ProofState server
+        run: |
+          echo "Checking if the ProofState server is up..."
+          retry_count=0
+          max_retries=20
+          until curl --output /dev/null --silent --head --fail http://localhost:3000/api/public/health && \
+            uv run --frozen python -c "from proofstate import ProofState; client = ProofState(); project_id = client._get_project_id(); assert project_id == '7a88fb47-b4e2-43b8-a06c-a5ce950dc53a', project_id; print(project_id)"
+          do
+            retry_count=`expr $retry_count + 1`
+            echo "Attempt $retry_count of $max_retries..."
+            if [ $retry_count -ge $max_retries ]; then
+              echo "ProofState server did not respond in time. Printing logs..."
+              (cd ./proofstate-server && docker compose ps)
+              (cd ./proofstate-server && docker compose logs proofstate-web proofstate-worker)
+              echo "Failing the step..."
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "ProofState server is up and running!"
+
+      - name: Select e2e shard files
+        if: ${{ matrix.suite == 'e2e' }}
+        run: |
+          uv run --frozen python scripts/select_e2e_shard.py \
+            --shard-index ${{ matrix.shard_index }} \
+            --shard-count ${{ matrix.shard_count }} \
+            --json
+          uv run --frozen python scripts/select_e2e_shard.py \
+            --shard-index ${{ matrix.shard_index }} \
+            --shard-count ${{ matrix.shard_count }} \
+            > "$RUNNER_TEMP/e2e-shard-files.txt"
+          cat "$RUNNER_TEMP/e2e-shard-files.txt"
+
+      - name: Run the parallel end-to-end tests
+        if: ${{ matrix.suite == 'e2e' }}
+        run: |
+          uv run --frozen python --version
+          mapfile -t e2e_files < "$RUNNER_TEMP/e2e-shard-files.txt"
+          set +e
+          uv run --frozen pytest \
+            -n 4 --dist worksteal \
+            -s -v --log-cli-level=INFO \
+            --timeout=180 --timeout-method=thread --durations=20 \
+            "${e2e_files[@]}" -m "not serial_e2e"
+          status=$?
+          set -e
+          if [ "$status" -eq 5 ]; then
+            echo "No parallel e2e tests selected for this shard."
+          elif [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+
+      - name: Run serial end-to-end tests
+        if: ${{ matrix.suite == 'e2e' }}
+        run: |
+          mapfile -t e2e_files < "$RUNNER_TEMP/e2e-shard-files.txt"
+          set +e
+          uv run --frozen pytest \
+            -s -v --log-cli-level=INFO \
+            --timeout=180 --timeout-method=thread --durations=20 \
+            "${e2e_files[@]}" -m "serial_e2e"
+          status=$?
+          set -e
+          if [ "$status" -eq 5 ]; then
+            echo "No serial e2e tests selected for this shard."
+          elif [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+
+      - name: Run live-provider tests
+        if: ${{ matrix.suite == 'live_provider' }}
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          HUGGINGFACEHUB_API_TOKEN: ${{ secrets.HUGGINGFACEHUB_API_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          uv run --frozen python --version
+          uv run --frozen pytest \
+            -n 4 --dist worksteal \
+            -s -v --log-cli-level=INFO \
+            --timeout=180 --timeout-method=thread --durations=20 \
+            tests/live_provider -m "live_provider"
+
+  all-tests-passed:
+    # This allows a single branch protection rule for the matrix checks.
+    runs-on: ubuntu-latest
+    needs: [unit-tests, e2e-tests, linting, type-checking, build]
+    if: always()
+    steps:
+      - name: All required checks passed
+        if: ${{ !(contains(needs.*.result, 'failure')) }}
+        run: exit 0
+      - name: Required check failed
+        if: ${{ contains(needs.*.result, 'failure') }}
+        run: exit 1

@@ -1,0 +1,7 @@
+services:
+  proofstate-worker:
+    environment:
+      PROOFSTATE_MIGRATION_V4_WRITE_MODE: dual
+  proofstate-web:
+    environment:
+      PROOFSTATE_MIGRATION_V4_WRITE_MODE: dual

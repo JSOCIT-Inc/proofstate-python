@@ -1,0 +1,66 @@
+{#
+Root page of the ProofState Python SDK reference.
+
+pdoc's default index is a bare `<meta http-equiv="refresh">` stub with no
+title, no links and no canonical URL, because a single root module makes
+`proofstate.html` the entry point. Search engines read that stub as a
+soft-redirecting duplicate of `/index.html`. Setting `root_module_name` to
+false -- the escape hatch the default template documents -- renders the real
+module list instead, and the `content` block below gives that page something
+to say, since pdoc's own version leaves the main column empty.
+#}
+{% set canonical_base_url = env.get("PDOC_CANONICAL_BASE_URL", "").rstrip("/") %}
+{% set root_module_name = false %}
+{% extends "default/index.html.jinja2" %}
+
+{% block title %}ProofState Python SDK API reference{% endblock %}
+
+{% block head %}
+    {% if canonical_base_url %}<link rel="canonical" href="{{ canonical_base_url }}/"/>{% endif %}
+    <meta name="description"
+          content="Generated API reference for the ProofState Python SDK: clients, tracing, prompt management, datasets, evaluation and the underlying API models."/>
+{% endblock %}
+
+{% block content %}
+    <header class="pdoc">
+        {{ self.logo() }}
+        {% if search %}
+            <input type="search" placeholder="Search API Documentation..." aria-label="search box">
+        {% endif %}
+    </header>
+    <main class="pdoc">
+        <section>
+            <h1>ProofState Python SDK API reference</h1>
+            <p>
+                Generated reference for the <code>proofstate</code> package. Start with
+                the <a href="https://proofstate.ai">ProofState website</a> for product information.
+            </p>
+            <h2>Start here</h2>
+            {#
+            These keep the `.html` suffix even though the hosted site serves
+            clean URLs. pdoc generates its own sidebar links that way, and
+            extensionless paths 404 both under pdoc's dev server and when the
+            built output is served locally, so the one 308 hop in production is
+            the cheaper trade. Canonical URLs are a different case -- those must
+            not point at a redirect, which is why they drop the suffix.
+            #}
+            <ul>
+                <li><a href="proofstate.html"><code>proofstate</code></a> &mdash; the
+                    <code>ProofState</code> client, tracing decorators and context helpers.
+                    Most code only needs this module.</li>
+                <li><a href="proofstate/experiment.html"><code>proofstate.experiment</code></a>
+                    &mdash; running experiments over datasets and scoring the results.</li>
+                <li><a href="proofstate/api.html"><code>proofstate.api</code></a> &mdash; the
+                    generated low-level API client and its request and response models.</li>
+            </ul>
+            <h2>Elsewhere</h2>
+            <ul>
+                <li><a href="https://proofstate.ai">ProofState</a></li>
+            </ul>
+            <p>Every module is listed in the sidebar, and the search box covers all of them.</p>
+        </section>
+    </main>
+    {% if search %}
+        {% include "search.html.jinja2" %}
+    {% endif %}
+{% endblock %}
