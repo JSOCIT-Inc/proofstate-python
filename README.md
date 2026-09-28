@@ -6,7 +6,7 @@ The protocol used by the `4.15.6rc2` prerelease was checked against the ProofSta
 
 ## Install
 
-Use Python 3.10 or newer. After publication, install the prerelease from PyPI:
+Use Python 3.10 or newer. Install the published prerelease from PyPI:
 
 ```bash
 python -m pip install --pre proofstate==4.15.6rc2
