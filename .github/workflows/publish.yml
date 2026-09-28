@@ -1,0 +1,98 @@
+name: Publish Python prerelease
+
+on:
+  release:
+    types: [published]
+
+permissions: {}
+
+concurrency:
+  group: pypi-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: ${{ github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.11.2"
+          python-version: "3.13"
+      - name: Validate tag, version, and release source
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          COMPAT_VERIFIED_TAG: ${{ vars.PROOFSTATE_RELEASE_COMPAT_VERIFIED_TAG }}
+        run: |
+          test "$RELEASE_TAG" = "$COMPAT_VERIFIED_TAG"
+          git fetch origin main
+          git merge-base --is-ancestor HEAD origin/main
+          uv run --frozen python - <<'PY'
+          import os
+          import tomllib
+          from packaging.version import Version
+
+          with open("pyproject.toml", "rb") as project_file:
+              project = tomllib.load(project_file)
+          assert project["project"]["name"] == "proofstate"
+          version = project["project"]["version"]
+          assert Version(version).is_prerelease and not Version(version).is_devrelease
+          assert os.environ["RELEASE_TAG"] == f"v{version}"
+          PY
+      - name: Install and run unit checks
+        run: |
+          uv sync --locked
+          uv run --frozen ruff check .
+          uv run --frozen pytest tests/unit
+      - name: Build source archive and wheel
+        run: uv build --no-sources
+      - name: Validate clean wheel and source archive installations
+        run: |
+          uv venv "$RUNNER_TEMP/proofstate-wheel-check" --python 3.13
+          uv pip install --python "$RUNNER_TEMP/proofstate-wheel-check/bin/python" dist/*.whl
+          uv venv "$RUNNER_TEMP/proofstate-sdist-check" --python 3.13
+          uv pip install --python "$RUNNER_TEMP/proofstate-sdist-check/bin/python" dist/*.tar.gz
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/proofstate-wheel-check/bin/python" - <<'PY'
+          from importlib.metadata import version
+          import proofstate
+          import proofstate.api
+
+          assert version("proofstate") == proofstate.__version__
+          PY
+          "$RUNNER_TEMP/proofstate-sdist-check/bin/python" - <<'PY'
+          from importlib.metadata import version
+          import proofstate
+          import proofstate.api
+
+          assert version("proofstate") == proofstate.__version__
+          PY
+      - name: Upload verified distributions
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: python-distributions
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download verified distributions
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: python-distributions
+          path: dist
+      - name: Publish to PyPI with Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1

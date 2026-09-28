@@ -1259,7 +1259,7 @@ wheels = [
 
 [[package]]
 name = "proofstate"
-version = "4.15.6"
+version = "4.15.6rc1"
 source = { editable = "." }
 dependencies = [
     { name = "backoff" },

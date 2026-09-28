@@ -68,4 +68,6 @@ python scripts/sanitize_generated_api_docs.py --check
 uv build --no-sources
 ```
 
-Before publishing, create a ProofState-owned PyPI project, configure a ProofState-owned trusted publisher, review the generated API against the deployed server, run unit and server-backed tests, and verify the wheel and source archive install in clean environments. No release workflow is configured yet; cloning or building this repository does not publish a package.
+Before publishing, create a ProofState-owned PyPI project or pending publisher, review the generated API against the deployed server, and run server-backed tests. The first planned prerelease version is `4.15.6rc1`; the repository must not be tagged until the matching server has passed compatibility checks.
+
+The `.github/workflows/publish.yml` workflow builds and checks the distributions, then publishes a GitHub prerelease tagged exactly `v4.15.6rc1` using PyPI Trusted Publishing. It does not use a stored PyPI token. Configure the PyPI publisher with owner `JSOCIT-Inc`, repository `proofstate-python`, workflow `publish.yml`, and environment `pypi`. Configure the GitHub `pypi` environment with required reviewers. After server-backed compatibility checks pass for a release, set repository variable `PROOFSTATE_RELEASE_COMPAT_VERIFIED_TAG` to that exact release tag; the workflow fails closed if it does not match. The package has not been uploaded merely by adding this workflow.

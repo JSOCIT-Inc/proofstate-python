@@ -35,4 +35,4 @@ Keep `.env.template`, README, package metadata, tests, and CI in sync with confi
 
 ## Release
 
-No publishing workflow is configured. Do not publish until a ProofState-owned source repository and PyPI project, trusted publisher, clean artifact installs, and server-backed compatibility checks exist. Use `bash scripts/build_reference_docs.sh` for local API reference generation.
+The `publish.yml` workflow publishes tagged prereleases with PyPI Trusted Publishing. Do not trigger a release until the ProofState-owned PyPI project or pending publisher, protected `pypi` GitHub environment, clean artifact installs, and server-backed compatibility checks exist. After those checks, set `PROOFSTATE_RELEASE_COMPAT_VERIFIED_TAG` to the exact release tag. Use `bash scripts/build_reference_docs.sh` for local API reference generation.
