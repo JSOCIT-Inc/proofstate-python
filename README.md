@@ -2,17 +2,17 @@
 
 Python client for [ProofState](https://proofstate.ai): OpenTelemetry tracing, prompts, datasets, evaluations, scores, and the public REST API. The required MIT license notice is in [LICENSE](LICENSE).
 
-This repository contains a source prerelease. No package has been published to PyPI or verified against the live ProofState deployment. Use it with a matching server revision after authenticated end-to-end checks.
+The protocol used by the `4.15.6rc2` prerelease was checked against the ProofState server deployed at `https://proofstate.ai` on 2026-09-28. Use a test project when adopting a prerelease.
 
-## Install from this checkout
+## Install
 
-Use Python 3.10 or newer. In the repository root:
+Use Python 3.10 or newer. After publication, install the prerelease from PyPI:
 
 ```bash
-python -m pip install .
+python -m pip install --pre proofstate==4.15.6rc2
 ```
 
-The distribution and import name are both `proofstate`. The package has not been published to PyPI by this checkout; `pip install proofstate` will work only after a ProofState release is published.
+The distribution and import name are both `proofstate`. To install from a source checkout instead, run `python -m pip install .` in the repository root.
 
 ## Configure
 
@@ -51,7 +51,7 @@ client.flush()  # Flush before a short-lived process exits.
 
 The SDK sends `x-proofstate-*` headers, `proofstate.*` OpenTelemetry attributes, `proofstate-sdk` instrumentation scope, `proofstate_` baggage, `@@@proofstateMedia` references, and ProofState JSON field names. Its SDK identity is `proofstate-python` and it requests ingestion version `4`.
 
-Deploy the matching ProofState server protocol before using this version. The currently deployed server may require the prior protocol, so ingestion and generated REST responses must be checked together in a test deployment. No legacy-named fallback is emitted by this SDK.
+Use a matching ProofState server protocol. Authenticated production checks on 2026-09-28 covered project authentication, prompts, datasets, scores, experiments, span ingestion, v2 observation readback, and MCP tool discovery. No legacy-named fallback is emitted by this SDK. On a server running v4 `events_only` mode, the legacy `client.api.trace.get()` endpoint returns 404; read spans through `client.api.observations.get_many(trace_id=...)` instead.
 
 The generated `proofstate/api/` client mirrors an API schema snapshot. When ProofState's API diverges, regenerate it from ProofState's OpenAPI/Fern source before publishing a new SDK release.
 
@@ -68,6 +68,6 @@ python scripts/sanitize_generated_api_docs.py --check
 uv build --no-sources
 ```
 
-Before publishing, create a ProofState-owned PyPI project or pending publisher, review the generated API against the deployed server, and run server-backed tests. The first planned prerelease version is `4.15.6rc1`; the repository must not be tagged until the matching server has passed compatibility checks.
+Before each release, review the generated API against the deployed server, run server-backed tests, and install the built wheel and source archive in clean environments. Tag only a version that passed those checks.
 
-The `.github/workflows/publish.yml` workflow builds and checks the distributions, then publishes a GitHub prerelease tagged exactly `v4.15.6rc1` using PyPI Trusted Publishing. It does not use a stored PyPI token. Configure the PyPI publisher with owner `JSOCIT-Inc`, repository `proofstate-python`, workflow `publish.yml`, and environment `pypi`. Configure the GitHub `pypi` environment with required reviewers. After server-backed compatibility checks pass for a release, set repository variable `PROOFSTATE_RELEASE_COMPAT_VERIFIED_TAG` to that exact release tag; the workflow fails closed if it does not match. The package has not been uploaded merely by adding this workflow.
+The `.github/workflows/publish.yml` workflow builds and checks the distributions, then publishes a GitHub prerelease whose tag matches the package version using PyPI Trusted Publishing. It does not use a stored PyPI token. The PyPI publisher is scoped to owner `JSOCIT-Inc`, repository `proofstate-python`, workflow `publish.yml`, and environment `pypi`. The GitHub `pypi` environment requires release review. After server-backed compatibility checks pass, set repository variable `PROOFSTATE_RELEASE_COMPAT_VERIFIED_TAG` to the exact release tag; the workflow fails closed if it does not match.
